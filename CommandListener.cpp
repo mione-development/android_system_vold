@@ -710,7 +710,9 @@ static android::status_t runCommandInNamespace(const std::string& command,
         }
     }
 
-    // Matches so far, but refuse to touch if in root namespace
+    // Check if mount namespaces are supported by the kernel
+    // (Linux 3.4 and older do not have /proc/<pid>/ns/mnt)
+    bool nsSupported = true;
     {
         char rootName[PATH_MAX];
         char pidName[PATH_MAX];
@@ -718,32 +720,36 @@ static android::status_t runCommandInNamespace(const std::string& command,
                 android::vold::SaneReadLinkAt(dirfd(dir.get()), "1/ns/mnt", rootName, PATH_MAX);
         const int pid_result =
                 android::vold::SaneReadLinkAt(pid_fd.get(), "ns/mnt", pidName, PATH_MAX);
-        if (root_result == -1) {
-            LOG(ERROR) << "Failed to readlink for /proc/1/ns/mnt";
-            return -EPERM;
-        }
-        if (pid_result == -1) {
-            LOG(ERROR) << "Failed to readlink for /proc/" << pid << "/ns/mnt";
-            return -EPERM;
-        }
-        if (!strcmp(rootName, pidName)) {
+        if (root_result == -1 || pid_result == -1) {
+            LOG(WARNING) << "Mount namespaces not available (old kernel?), "
+                         << "skipping namespace isolation for appfuse";
+            nsSupported = false;
+        } else if (!strcmp(rootName, pidName)) {
             LOG(ERROR) << "Don't mount appfuse in root namespace";
             return -EPERM;
         }
     }
 
     // We purposefully leave the namespace open across the fork
-    android::vold::ScopedFd ns_fd(openat(pid_fd.get(), "ns/mnt", O_RDONLY));
-    if (ns_fd.get() < 0) {
-        PLOG(ERROR) << "Failed to open namespace for /proc/" << pid << "/ns/mnt";
-        return -errno;
+    int ns_fd_raw = -1;
+    if (nsSupported) {
+        ns_fd_raw = openat(pid_fd.get(), "ns/mnt", O_RDONLY);
+        if (ns_fd_raw < 0) {
+            PLOG(ERROR) << "Failed to open namespace for /proc/" << pid << "/ns/mnt";
+            return -errno;
+        }
     }
+    android::vold::ScopedFd ns_fd(ns_fd_raw);
 
     int child = fork();
     if (child == 0) {
-        if (setns(ns_fd.get(), CLONE_NEWNS) != 0) {
-            PLOG(ERROR) << "Failed to setns";
-            _exit(-errno);
+        if (nsSupported) {
+            if (setns(ns_fd.get(), CLONE_NEWNS) != 0) {
+                PLOG(ERROR) << "Failed to setns";
+                _exit(-errno);
+            }
+        } else {
+            LOG(DEBUG) << "Mount namespaces not available, proceeding without setns";
         }
 
         if (command == "mount") {
